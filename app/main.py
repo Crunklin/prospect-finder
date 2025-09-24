@@ -1,367 +1,453 @@
 import os
-import secrets
-import json
-from pathlib import Path
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, Depends, HTTPException, status, Query
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel
-import httpx
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-# Load environment variables
+from app.services.places_client import PlacesClient, Center
+from app.models.schemas import (
+    SearchRequest,
+    SearchResponse,
+    PlaceLite,
+)
+from app.utils.categories import load_category_packs, CategoryPack
+from app.utils.filters import apply_residential_filter
+
 load_dotenv()
 
-# Initialize FastAPI app
-app = FastAPI(title="Fleet Prospect Finder", version="1.0.0")
 
-# Setup authentication
-security = HTTPBasic()
+def _haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two points on Earth in meters."""
+    from math import radians, sin, cos, sqrt, atan2
+    R = 6371000.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return R * c
 
-def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
-    """Simple authentication check"""
-    correct_username = os.getenv("APP_USERNAME", "admin")
-    correct_password = os.getenv("APP_PASSWORD", "changeme123")
-    
-    is_correct_username = secrets.compare_digest(credentials.username, correct_username)
-    is_correct_password = secrets.compare_digest(credentials.password, correct_password)
-    
-    if not (is_correct_username and is_correct_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return credentials.username
 
-# CORS middleware
+def _parse_address_parts(addr: str) -> Dict[str, str]:
+    """Heuristic US-centric parser: returns street, city, state, zip. Ignores trailing country segment."""
+    out = {"street": "", "city": "", "state": "", "zip": ""}
+    if not addr:
+        return out
+    parts = [p.strip() for p in addr.split(",") if p.strip()]
+    if len(parts) >= 2:
+        last = parts[-1]
+        # Drop trailing country like 'USA' or 'United States'
+        if last.upper() in {"USA", "US", "UNITED STATES"} or (last.isalpha() and len(last) > 2):
+            parts = parts[:-1]
+    if len(parts) >= 3:
+        out["street"] = ", ".join(parts[:-2])
+        out["city"] = parts[-2]
+        last = parts[-1]
+        import re
+        m = re.search(r"([A-Z]{2})\s*,?\s*(\d{5})(?:-\d{4})?", last, flags=re.I)
+        if m:
+            out["state"] = m.group(1).upper()
+            out["zip"] = m.group(2)
+        else:
+            segs = last.split()
+            if len(segs) >= 2:
+                out["state"] = segs[0].upper()
+                out["zip"] = segs[1]
+            else:
+                out["state"] = last.upper()
+    else:
+        out["street"] = addr
+    return out
+
+app = FastAPI(title="Fleet Prospect Finder - MVP (Places API)")
+
+# CORS for local dev and typical ports
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:8003",
-        "https://crunklin.github.io",
-        "https://Crunklin.github.io"
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pydantic models
-class SearchRequest(BaseModel):
-    location: str
-    categories: List[str]
-    radius: int = 5000
-    exclude_service_area_only: bool = True
-
-class BusinessResult(BaseModel):
-    name: str
-    address: str
-    city: str
-    state: str
-    zip_code: str
-    phone: Optional[str] = None
-    website: Optional[str] = None
-    rating: Optional[float] = None
-    total_ratings: Optional[int] = None
-    category: str
-    distance: Optional[float] = None
-    lat: Optional[float] = None
-    lng: Optional[float] = None
-
-class SearchResponse(BaseModel):
-    results: List[BusinessResult]
-    total_count: int
-    search_info: Dict[str, Any]
-
-# Cache for search results (simple in-memory cache)
-search_cache = {}
-CACHE_DURATION = timedelta(minutes=20)
-
-# Google Places API configuration
 PLACES_API_KEY = os.getenv("PLACES_API_KEY")
 if not PLACES_API_KEY:
-    print("WARNING: PLACES_API_KEY not found in environment variables")
+    # Don't crash app; raise on first use instead to make DX smooth
+    pass
 
-def load_category_packs():
-    """Load category packs from JSON file"""
-    try:
-        data_path = Path("data/categories.json")
-        if not data_path.exists():
-            # Fallback category data if file doesn't exist
-            return {
-                "Automotive & Fleet Core": [
-                    "car_dealer", "car_rental", "car_repair", "gas_station"
-                ],
-                "Home / Field Services": [
-                    "electrician", "plumber", "roofing_contractor", "painter"
-                ],
-                "Logistics / Mobility": [
-                    "moving_company", "storage", "taxi_service", "logistics"
-                ],
-                "Industrial / Construction Ops": [
-                    "general_contractor", "electrician", "plumber", "hardware_store"
-                ],
-                "Recreation": [
-                    "amusement_park", "zoo", "aquarium", "tourist_attraction"
-                ]
-            }
-        
-        with open(data_path, 'r') as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"Error loading categories: {e}")
-        # Return fallback data
-        return {
-            "Automotive & Fleet Core": [
-                "car_dealer", "car_rental", "car_repair", "gas_station"
-            ],
-            "Home / Field Services": [
-                "electrician", "plumber", "roofing_contractor", "painter"
-            ]
-        }
-
-# Load categories
+# Load category taxonomy with a simple reload helper so JSON edits don't require server restart
 CATEGORY_PACKS = load_category_packs()
+CATEGORY_PACKS_BY_KEY: Dict[str, CategoryPack] = {p.key: p for p in CATEGORY_PACKS}
 
-async def geocode_location(location: str) -> Dict[str, float]:
-    """Convert location string to lat/lng coordinates"""
-    if not PLACES_API_KEY:
-        raise HTTPException(status_code=500, detail="Google Places API key not configured")
-    
-    cache_key = f"geocode_{location.lower()}"
-    if cache_key in search_cache:
-        cached_result, timestamp = search_cache[cache_key]
-        if datetime.now() - timestamp < CACHE_DURATION:
-            return cached_result
-    
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {
-        "address": location,
-        "key": PLACES_API_KEY
-    }
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, params=params)
-        data = response.json()
-    
-    if data["status"] != "OK" or not data["results"]:
-        raise HTTPException(status_code=400, detail=f"Could not geocode location: {location}")
-    
-    result = data["results"][0]
-    coords = {
-        "lat": result["geometry"]["location"]["lat"],
-        "lng": result["geometry"]["location"]["lng"]
-    }
-    
-    # Cache the result
-    search_cache[cache_key] = (coords, datetime.now())
-    return coords
+def reload_categories() -> None:
+    global CATEGORY_PACKS, CATEGORY_PACKS_BY_KEY
+    packs = load_category_packs()
+    CATEGORY_PACKS = packs
+    CATEGORY_PACKS_BY_KEY = {p.key: p for p in packs}
 
-async def search_places_nearby(lat: float, lng: float, place_types: List[str], radius: int) -> List[Dict]:
-    """Search for places using Google Places API"""
-    if not PLACES_API_KEY:
-        raise HTTPException(status_code=500, detail="Google Places API key not configured")
-    
-    all_results = []
-    
-    for place_type in place_types:
-        cache_key = f"search_{lat}_{lng}_{place_type}_{radius}"
-        if cache_key in search_cache:
-            cached_result, timestamp = search_cache[cache_key]
-            if datetime.now() - timestamp < CACHE_DURATION:
-                all_results.extend(cached_result)
-                continue
-        
-        url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-        params = {
-            "location": f"{lat},{lng}",
-            "radius": radius,
-            "type": place_type,
-            "key": PLACES_API_KEY
-        }
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, params=params)
-            data = response.json()
-        
-        if data["status"] == "OK":
-            # Cache the results
-            search_cache[cache_key] = (data["results"], datetime.now())
-            all_results.extend(data["results"])
-    
-    return all_results
+# Minimal field mask per PRD (plus pureServiceAreaBusiness when present)
+FIELD_MASK = (
+    "places.id,"
+    "places.displayName,"
+    "places.formattedAddress,"
+    "places.location,"
+    "places.types,"
+    "places.primaryType,"
+    "places.businessStatus,"
+    "places.googleMapsUri,"
+    "places.rating,"
+    "places.userRatingCount,"
+    "places.pureServiceAreaBusiness"
+)
 
-def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """Calculate distance between two points in miles"""
-    from math import radians, cos, sin, asin, sqrt
-    
-    # Convert to radians
-    lat1, lng1, lat2, lng2 = map(radians, [lat1, lng1, lat2, lng2])
-    
-    # Haversine formula
-    dlat = lat2 - lat1
-    dlng = lng2 - lng1
-    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlng/2)**2
-    c = 2 * asin(sqrt(a))
-    r = 3959  # Radius of earth in miles
-    return c * r
+# In-memory cache for search responses (20 minute TTL)
+_CACHE_TTL_SECONDS = 20 * 60
+_SEARCH_CACHE: Dict[Tuple[float, float, int, Tuple[str, ...], bool], Tuple[float, Dict[str, Any]]] = {}
 
-# Routes
+def _build_cache_key(center_lat: float, center_lng: float, radius_meters: int, categories: List[str], high_recall: bool) -> Tuple[float, float, int, Tuple[str, ...], bool]:
+    # Round lat/lng to avoid overly granular keys; 5 decimals ~1.1 meters
+    lat_r = round(center_lat, 5)
+    lng_r = round(center_lng, 5)
+    cats = tuple(sorted(categories or []))
+    return (lat_r, lng_r, int(radius_meters), cats, bool(high_recall))
+
+def _cache_get(key: Tuple[float, float, int, Tuple[str, ...], bool]) -> Optional[Dict[str, Any]]:
+    import time
+    now = time.time()
+    # Opportunistic prune and fetch
+    stale: List[Tuple] = []
+    if _SEARCH_CACHE:
+        for k, (ts, _val) in list(_SEARCH_CACHE.items()):
+            if now - ts > _CACHE_TTL_SECONDS:
+                stale.append(k)
+    for k in stale:
+        _SEARCH_CACHE.pop(k, None)
+    entry = _SEARCH_CACHE.get(key)
+    if not entry:
+        return None
+    ts, val = entry
+    if now - ts > _CACHE_TTL_SECONDS:
+        _SEARCH_CACHE.pop(key, None)
+        return None
+    return val
+
+def _cache_set(key: Tuple[float, float, int, Tuple[str, ...], bool], value: Dict[str, Any]) -> None:
+    import time
+    _SEARCH_CACHE[key] = (time.time(), value)
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint (unprotected)"""
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
-
-@app.get("/")
-async def serve_app(user: str = Depends(get_current_user)):
-    """Serve the main application (protected)"""
-    return FileResponse('app/web/index.html')
-
-@app.get("/categories")
-async def get_categories(user: str = Depends(get_current_user)):
-    """Get available business categories (protected)"""
-    return CATEGORY_PACKS
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
 
 @app.post("/search/places", response_model=SearchResponse)
-async def search_places(request: SearchRequest, user: str = Depends(get_current_user)) -> SearchResponse:
-    """Search for places based on location and categories (protected)"""
+async def search_places(req: SearchRequest) -> SearchResponse:
+    # Ensure latest taxonomy (no server restart required after editing data/categories.json)
+    reload_categories()
+    if not PLACES_API_KEY:
+        raise HTTPException(status_code=500, detail="PLACES_API_KEY not configured")
+
+    client = PlacesClient(api_key=PLACES_API_KEY, field_mask=FIELD_MASK)
+
+    # Resolve center
+    center: Center
+    if req.center.text is not None:
+        center = Center(text=req.center.text)
+    elif req.center.lat is not None and req.center.lng is not None:
+        center = Center(lat=req.center.lat, lng=req.center.lng)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid center: provide either text or lat/lng")
+
+    # Resolve to numeric coordinates for strict radius filtering
     try:
-        # Geocode the location
-        coords = await geocode_location(request.location)
-        
-        # Get all place types for selected categories
-        place_types = []
-        for category_pack in request.categories:
-            if category_pack in CATEGORY_PACKS:
-                place_types.extend(CATEGORY_PACKS[category_pack])
-        
-        if not place_types:
-            return SearchResponse(
-                results=[],
-                total_count=0,
-                search_info={
-                    "location": request.location,
-                    "coordinates": coords,
-                    "message": "No valid categories selected"
-                }
-            )
-        
-        # Search for places
-        places = await search_places_nearby(
-            coords["lat"], 
-            coords["lng"], 
-            place_types, 
-            request.radius
-        )
-        
-        # Process results
-        results = []
-        seen_places = set()  # To avoid duplicates
-        
-        for place in places:
-            place_id = place.get("place_id")
-            if place_id in seen_places:
-                continue
-            seen_places.add(place_id)
-            
-            # Filter out service area only businesses if requested
-            if request.exclude_service_area_only:
-                if not place.get("geometry", {}).get("location"):
-                    continue
-            
-            # Extract address components
-            address_components = place.get("vicinity", "")
-            formatted_address = place.get("formatted_address", address_components)
-            
-            # Parse address (basic parsing)
-            address_parts = formatted_address.split(",") if formatted_address else [""]
-            address = address_parts[0].strip() if address_parts else ""
-            city = address_parts[1].strip() if len(address_parts) > 1 else ""
-            state_zip = address_parts[2].strip() if len(address_parts) > 2 else ""
-            
-            # Extract state and zip (basic regex could be added here)
-            state = state_zip.split()[0] if state_zip else ""
-            zip_code = ""
-            if state_zip:
-                zip_parts = state_zip.split()
-                if len(zip_parts) > 1:
-                    zip_code = zip_parts[-1]
-            
-            # Calculate distance
-            place_location = place.get("geometry", {}).get("location", {})
-            distance = None
-            if place_location:
-                distance = calculate_distance(
-                    coords["lat"], coords["lng"],
-                    place_location["lat"], place_location["lng"]
-                )
-            
-            # Determine category
-            place_types_list = place.get("types", [])
-            category = "Unknown"
-            for pack_name, pack_types in CATEGORY_PACKS.items():
-                if any(pt in place_types_list for pt in pack_types):
-                    category = pack_name
-                    break
-            
-            result = BusinessResult(
-                name=place.get("name", "Unknown"),
-                address=address,
-                city=city,
-                state=state,
-                zip_code=zip_code,
-                phone=None,  # Would need Places Details API for phone
-                website=None,  # Would need Places Details API for website
-                rating=place.get("rating"),
-                total_ratings=place.get("user_ratings_total"),
-                category=category,
-                distance=round(distance, 2) if distance else None,
-                lat=place_location.get("lat") if place_location else None,
-                lng=place_location.get("lng") if place_location else None
-            )
-            results.append(result)
-        
-        # Sort by distance
-        results.sort(key=lambda x: x.distance or float('inf'))
-        
-        return SearchResponse(
-            results=results,
-            total_count=len(results),
-            search_info={
-                "location": request.location,
-                "coordinates": coords,
-                "radius_miles": request.radius * 0.000621371,  # Convert meters to miles
-                "categories_searched": request.categories,
-                "place_types": place_types
-            }
-        )
-        
-    except HTTPException:
-        raise
+        center_geo = await client.resolve_center(center)
+        center_lat, center_lng = center_geo["latitude"], center_geo["longitude"]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Failed to resolve center: {e}")
 
-# Mount static files (for CSS, JS, etc.)
-if Path("app/web").exists():
-    app.mount("/static", StaticFiles(directory="app/web"), name="static")
+    # Cache lookup (keyed by resolved center, radius, packs, highRecall)
+    cache_key = _build_cache_key(center_lat, center_lng, req.radiusMeters, req.categories, req.highRecall or False)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        # Compose response using cached payload
+        return SearchResponse(
+            results=cached.get("results", []),
+            nextPageToken=cached.get("nextPageToken"),
+            centerLat=center_lat,
+            centerLng=center_lng,
+        )
 
-# Serve individual static files
-@app.get("/{file_path:path}")
-async def serve_static_files(file_path: str, user: str = Depends(get_current_user)):
-    """Serve static files (protected)"""
-    static_file_path = Path(f"app/web/{file_path}")
-    if static_file_path.exists() and static_file_path.is_file():
-        return FileResponse(static_file_path)
-    raise HTTPException(status_code=404, detail="File not found")
+    # Execute per selected category pack to tag results with pack labels
+    results_by_id: Dict[str, PlaceLite] = {}
+    # Store upstream pagination tokens together with their originating pack label
+    paginate_queue: List[tuple[str, str]] = []  # (next_page_token, pack_label)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    max_results = req.maxResults or 60
+
+    for key in req.categories:
+        pack = CATEGORY_PACKS_BY_KEY.get(key)
+        if not pack:
+            raise HTTPException(status_code=400, detail=f"Unknown category pack: {key}")
+
+        pack_label = pack.label
+
+        # Nearby: use pack's includedTypes if any
+        if pack.includedTypes:
+            nearby_resp = await client.search_nearby(
+                center=center,
+                radius_meters=req.radiusMeters,
+                included_types=pack.includedTypes,
+                max_result_count=min(20, max_results),
+            )
+            for r in nearby_resp.results:
+                existing = results_by_id.get(r.placeId)
+                if existing:
+                    if pack_label not in (existing.categories or []):
+                        existing.categories.append(pack_label)
+                else:
+                    r.categories = [pack_label]
+                    results_by_id[r.placeId] = r
+            if nearby_resp.next_page_token:
+                paginate_queue.append((nearby_resp.next_page_token, pack_label))
+
+        # Text Search: use pack's keywords if any
+        if pack.keywords:
+            seg = " OR ".join(pack.keywords)
+            text_resp = await client.search_text(
+                text_query=seg,
+                center=center,
+                radius_meters=req.radiusMeters,
+                max_result_count=min(20, max_results),
+            )
+            for r in text_resp.results:
+                existing = results_by_id.get(r.placeId)
+                if existing:
+                    if pack_label not in (existing.categories or []):
+                        existing.categories.append(pack_label)
+                else:
+                    r.categories = [pack_label]
+                    results_by_id[r.placeId] = r
+            if text_resp.next_page_token:
+                paginate_queue.append((text_resp.next_page_token, pack_label))
+
+    # Recall boost: If auto-repair related packs are selected and highRecall is on, run an extra targeted text search and merge
+    try:
+        AUTO_RECALL_KEYS = {
+            "auto_traditional",  # general auto repair
+            "quick_lube",
+            "tire_shops",
+            "auto_glass",
+            "body_collision",
+        }
+        if req.highRecall and any(k in AUTO_RECALL_KEYS for k in req.categories):
+            boost_terms = [
+                "auto repair",
+                "mechanic",
+                "brake repair",
+                "muffler",
+                "transmission repair",
+                "oil change",
+                "engine repair",
+                "tire service",
+                "alignment",
+            ]
+            boost_query = " OR ".join(boost_terms)
+            boost_resp = await client.search_text(
+                text_query=boost_query,
+                center=center,
+                radius_meters=req.radiusMeters,
+                max_result_count=min(20, max_results),
+            )
+            for r in boost_resp.results:
+                existing = results_by_id.get(r.placeId)
+                if existing:
+                    # Tag with a generic category label if not already tagged
+                    if "TRADITIONAL AUTO" not in (existing.categories or []):
+                        existing.categories.append("TRADITIONAL AUTO")
+                else:
+                    r.categories = ["TRADITIONAL AUTO"]
+                    results_by_id[r.placeId] = r
+            if boost_resp.next_page_token:
+                paginate_queue.append((boost_resp.next_page_token, "TRADITIONAL AUTO"))
+    except Exception:
+        # Boost is best-effort; do not fail the request if it errors
+        pass
+
+    # High-recall pagination: fetch additional pages round-robin across all queued next_page_tokens
+    if req.highRecall and paginate_queue:
+        try:
+            # Round-robin until max_results or tokens exhausted
+            idx = 0
+            while len(results_by_id) < max_results and paginate_queue:
+                token, label = paginate_queue.pop(0)
+                try:
+                    page = await client.fetch_next_page(next_page_token=token)
+                except Exception:
+                    continue
+                for r in page.results:
+                    existing = results_by_id.get(r.placeId)
+                    if existing:
+                        if label and label not in (existing.categories or []):
+                            existing.categories.append(label)
+                    else:
+                        r.categories = [label] if label else []
+                        results_by_id[r.placeId] = r
+                if page.next_page_token:
+                    paginate_queue.append((page.next_page_token, label))
+                idx = (idx + 1) % (len(paginate_queue) or 1)
+        except Exception:
+            # Don't fail the request if pagination fails
+            pass
+
+    merged_list = list(results_by_id.values())
+
+    # Strict radius enforcement: drop any results outside radiusMeters from the resolved center
+    radius_m = max(1, req.radiusMeters)
+    in_radius: List[PlaceLite] = []
+    for r in merged_list:
+        if r.lat is None or r.lng is None:
+            # Strict enforcement: drop if we cannot compute distance
+            continue
+        d = _haversine_meters(center_lat, center_lng, r.lat, r.lng)
+        if d <= radius_m:
+            in_radius.append(r)
+
+    # Apply residential/home-based exclusion if requested (default True per PRD)
+    filtered = apply_residential_filter(in_radius, exclude_service_area_only=req.excludeServiceAreaOnly)
+
+    # Truncate to max_results
+    filtered = filtered[:max_results]
+
+    # For compatibility, still expose the first available token if any
+    next_token = paginate_queue[0][0] if paginate_queue else None
+
+    resp = SearchResponse(results=filtered, nextPageToken=next_token, centerLat=center_lat, centerLng=center_lng)
+
+    # Store in cache
+    _cache_set(cache_key, {"results": resp.results, "nextPageToken": resp.nextPageToken})
+
+    return resp
+
+@app.get("/search/places/next", response_model=SearchResponse)
+async def search_places_next(token: str = Query(..., description="Upstream Places API nextPageToken")) -> SearchResponse:
+    reload_categories()
+    if not PLACES_API_KEY:
+        raise HTTPException(status_code=500, detail="PLACES_API_KEY not configured")
+
+    client = PlacesClient(api_key=PLACES_API_KEY, field_mask=FIELD_MASK)
+
+    try:
+        resp = await client.fetch_next_page(next_page_token=token)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # No filtering or merging on next page alone; just pass through and let client apply filters client-side if needed
+    return SearchResponse(results=resp.results, nextPageToken=resp.next_page_token)
+
+# New: Categories endpoint for frontend selector
+@app.get("/categories")
+def get_categories() -> List[Dict[str, Any]]:
+    reload_categories()
+    return [{"key": p.key, "label": p.label, "strategy": p.strategy, "includedTypes": p.includedTypes, "keywords": p.keywords} for p in CATEGORY_PACKS]
+
+# New: CSV export endpoint
+@app.post("/search/places/csv")
+async def search_places_csv(
+    req: SearchRequest = Body(...),
+    filterPrimaryTypes: Optional[List[str]] = Query(None),
+):
+    reload_categories()
+    import csv
+    import io
+
+    resp = await search_places(req)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "placeId",
+        "name",
+        "street",
+        "city",
+        "state",
+        "zip",
+        "lat",
+        "lng",
+        "primaryType",
+        "categories",
+        "types",
+        "businessStatus",
+        "googleMapsUri",
+        "pureServiceAreaBusiness",
+    ])
+    rows = resp.results
+    # Optional filter by primaryType
+    if filterPrimaryTypes:
+        # allow repeated query params or comma-separated list
+        values: List[str] = []
+        for v in filterPrimaryTypes:
+            if "," in v:
+                values.extend([s.strip() for s in v.split(",") if s.strip()])
+            else:
+                values.append(v)
+        allow = set(values)
+        rows = [r for r in rows if (r.primaryType in allow)]
+    for r in rows:
+        ap = _parse_address_parts(r.formattedAddress or "")
+        writer.writerow([
+            r.placeId,
+            r.name,
+            ap.get("street", ""),
+            ap.get("city", ""),
+            ap.get("state", ""),
+            ap.get("zip", ""),
+            r.lat if r.lat is not None else "",
+            r.lng if r.lng is not None else "",
+            r.primaryType or "",
+            ";".join(r.categories or []),
+            ";".join(r.types or []),
+            r.businessStatus or "",
+            r.googleMapsUri or "",
+            r.pureServiceAreaBusiness if r.pureServiceAreaBusiness is not None else "",
+        ])
+
+    output.seek(0)
+    headers = {"Content-Disposition": "attachment; filename=places_export.csv"}
+    return StreamingResponse(output, media_type="text/csv", headers=headers)
+
+# New: Place details enrichment (phone, website) for a list of placeIds
+@app.post("/places/details")
+async def places_details(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not PLACES_API_KEY:
+        raise HTTPException(status_code=500, detail="PLACES_API_KEY not configured")
+    ids = payload.get("placeIds") or []
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=400, detail="placeIds array required")
+    # Cap to 50 to limit cost/time
+    ids = ids[:50]
+    client = PlacesClient(api_key=PLACES_API_KEY, field_mask=FIELD_MASK)
+
+    out: Dict[str, Any] = {}
+    for pid in ids:
+        try:
+            data = await client.get_place_details(pid)
+            out[pid] = {
+                "phone": data.get("nationalPhoneNumber") or data.get("internationalPhoneNumber"),
+                "website": data.get("websiteUri"),
+            }
+        except Exception:
+            out[pid] = {"phone": None, "website": None}
+    return {"details": out}
+
+# Static frontend serving (app/web)
+WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
+if os.path.isdir(WEB_DIR):
+    app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+
+@app.get("/")
+def serve_index():
+    index_path = os.path.join(WEB_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"message": "Frontend not built. API is running."}
