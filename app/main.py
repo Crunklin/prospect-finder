@@ -488,7 +488,7 @@ async def import_prospects(payload: Dict[str, Any], username: str = Depends(veri
 # Static frontend serving (app/web) - NO authentication required
 WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
 if os.path.isdir(WEB_DIR):
-    app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+    #app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 # Protected frontend routes
 @app.get("/")
