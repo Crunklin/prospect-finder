@@ -1,12 +1,10 @@
 import os
 from typing import List, Optional, Dict, Any, Tuple
-import secrets
 
-from fastapi import FastAPI, HTTPException, Query, Body, Depends, status
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -20,26 +18,6 @@ from app.utils.categories import load_category_packs, CategoryPack
 from app.utils.filters import apply_residential_filter
 
 load_dotenv()
-
-# HTTP Basic Auth setup
-security = HTTPBasic()
-
-def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
-    """Verify username/password against Render environment variables"""
-    correct_username = os.getenv('APP_USERNAME', 'admin')
-    correct_password = os.getenv('APP_PASSWORD', 'changeme123')
-    
-    # Secure comparison to prevent timing attacks
-    is_correct_username = secrets.compare_digest(credentials.username, correct_username)
-    is_correct_password = secrets.compare_digest(credentials.password, correct_password)
-    
-    if not (is_correct_username and is_correct_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return credentials.username
 
 
 def _haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -160,14 +138,12 @@ def _cache_set(key: Tuple[float, float, int, Tuple[str, ...], bool], value: Dict
     import time
     _SEARCH_CACHE[key] = (time.time(), value)
 
-# Public health check (no auth required)
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
 
-# Protected API endpoints
 @app.post("/search/places", response_model=SearchResponse)
-async def search_places(req: SearchRequest, username: str = Depends(verify_credentials)) -> SearchResponse:
+async def search_places(req: SearchRequest) -> SearchResponse:
     # Ensure latest taxonomy (no server restart required after editing data/categories.json)
     reload_categories()
     if not PLACES_API_KEY:
@@ -355,7 +331,7 @@ async def search_places(req: SearchRequest, username: str = Depends(verify_crede
     return resp
 
 @app.get("/search/places/next", response_model=SearchResponse)
-async def search_places_next(token: str = Query(..., description="Upstream Places API nextPageToken"), username: str = Depends(verify_credentials)) -> SearchResponse:
+async def search_places_next(token: str = Query(..., description="Upstream Places API nextPageToken")) -> SearchResponse:
     reload_categories()
     if not PLACES_API_KEY:
         raise HTTPException(status_code=500, detail="PLACES_API_KEY not configured")
@@ -370,24 +346,23 @@ async def search_places_next(token: str = Query(..., description="Upstream Place
     # No filtering or merging on next page alone; just pass through and let client apply filters client-side if needed
     return SearchResponse(results=resp.results, nextPageToken=resp.next_page_token)
 
-# Categories endpoint - protected
+# New: Categories endpoint for frontend selector
 @app.get("/categories")
-def get_categories(username: str = Depends(verify_credentials)) -> List[Dict[str, Any]]:
+def get_categories() -> List[Dict[str, Any]]:
     reload_categories()
     return [{"key": p.key, "label": p.label, "strategy": p.strategy, "includedTypes": p.includedTypes, "keywords": p.keywords} for p in CATEGORY_PACKS]
 
-# CSV export endpoint - protected
+# New: CSV export endpoint
 @app.post("/search/places/csv")
 async def search_places_csv(
     req: SearchRequest = Body(...),
     filterPrimaryTypes: Optional[List[str]] = Query(None),
-    username: str = Depends(verify_credentials)
 ):
     reload_categories()
     import csv
     import io
 
-    resp = await search_places(req, username)
+    resp = await search_places(req)
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
@@ -441,9 +416,9 @@ async def search_places_csv(
     headers = {"Content-Disposition": "attachment; filename=places_export.csv"}
     return StreamingResponse(output, media_type="text/csv", headers=headers)
 
-# Place details enrichment - protected
+# New: Place details enrichment (phone, website) for a list of placeIds
 @app.post("/places/details")
-async def places_details(payload: Dict[str, Any], username: str = Depends(verify_credentials)) -> Dict[str, Any]:
+async def places_details(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not PLACES_API_KEY:
         raise HTTPException(status_code=500, detail="PLACES_API_KEY not configured")
     ids = payload.get("placeIds") or []
@@ -465,42 +440,14 @@ async def places_details(payload: Dict[str, Any], username: str = Depends(verify
             out[pid] = {"phone": None, "website": None}
     return {"details": out}
 
-# CRM import endpoint - protected (placeholder for your CRM implementation)
-@app.post("/prospects/import-from-search")
-async def import_prospects(payload: Dict[str, Any], username: str = Depends(verify_credentials)) -> Dict[str, Any]:
-    """Import prospects from search results to CRM"""
-    prospects = payload.get("prospects", [])
-    if not isinstance(prospects, list) or not prospects:
-        raise HTTPException(status_code=400, detail="prospects array required")
-    
-    # TODO: Implement your CRM import logic here
-    # For now, just return success
-    imported_count = len(prospects)
-    duplicates_count = 0
-    
-    return {
-        "status": "success",
-        "imported_count": imported_count,
-        "duplicates_count": duplicates_count,
-        "message": f"Successfully imported {imported_count} prospects"
-    }
-
-# Static frontend serving (app/web) - NO authentication required
+# Static frontend serving (app/web)
 WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
 if os.path.isdir(WEB_DIR):
     app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
-# Protected frontend routes
 @app.get("/")
-def serve_index(username: str = Depends(verify_credentials)):
+def serve_index():
     index_path = os.path.join(WEB_DIR, "index.html")
     if os.path.exists(index_path):
         return FileResponse(index_path)
     return {"message": "Frontend not built. API is running."}
-
-@app.get("/crm")
-def serve_crm(username: str = Depends(verify_credentials)):
-    crm_path = os.path.join(WEB_DIR, "crm.html")
-    if os.path.exists(crm_path):
-        return FileResponse(crm_path)
-    return {"message": "CRM interface not found"}

@@ -1,0 +1,860 @@
+import os
+import secrets
+import json
+import sqlite3
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+from datetime import datetime, date, timedelta
+from contextlib import contextmanager
+from enum import Enum
+
+from fastapi import FastAPI, Depends, HTTPException, status, Query
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, HTMLResponse
+from pydantic import BaseModel
+import httpx
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Initialize FastAPI app
+app = FastAPI(title="Fleet Field Sales CRM", version="2.0.0")
+
+# Setup authentication
+security = HTTPBasic()
+
+def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
+    """Simple authentication check"""
+    correct_username = os.getenv("APP_USERNAME", "admin")
+    correct_password = os.getenv("APP_PASSWORD", "changeme123")
+    
+    is_correct_username = secrets.compare_digest(credentials.username, correct_username)
+    is_correct_password = secrets.compare_digest(credentials.password, correct_password)
+    
+    if not (is_correct_username and is_correct_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:8003",
+        "https://crunklin.github.io",
+        "https://Crunklin.github.io"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Enums for field sales
+class ProspectStatus(str, Enum):
+    IDENTIFIED = "identified"
+    ASSIGNED = "assigned"
+    CONTACTED = "contacted"
+    QUALIFIED = "qualified"
+    PROPOSAL_REQUESTED = "proposal_requested"
+    ACCOUNT_OPENING = "account_opening"
+    ACCOUNT_OPENED = "account_opened"
+    FIRST_SALE = "first_sale"
+    ACTIVE_CUSTOMER = "active_customer"
+    NOT_INTERESTED = "not_interested"
+    NO_FLEET_NEED = "no_fleet_need"
+
+class VisitOutcome(str, Enum):
+    COMPLETED = "completed"
+    GATEKEEPER = "gatekeeper"
+    NOT_AVAILABLE = "not_available"
+    CLOSED = "closed"
+    MOVED = "moved"
+    INTERESTED = "interested"
+    NOT_INTERESTED = "not_interested"
+    FOLLOW_UP_SCHEDULED = "follow_up_scheduled"
+    DECISION_MAKER_IDENTIFIED = "decision_maker_identified"
+
+class ActivityType(str, Enum):
+    VISIT = "visit"
+    FOLLOW_UP_VISIT = "follow_up_visit"
+    PROPOSAL_DELIVERY = "proposal_delivery"
+    ACCOUNT_SETUP = "account_setup"
+    FIRST_SALE_ATTEMPT = "first_sale_attempt"
+    RELATIONSHIP_BUILDING = "relationship_building"
+    COMPETITIVE_INTEL = "competitive_intel"
+    REFERRAL_RECEIVED = "referral_received"
+
+# Pydantic models
+class SearchRequest(BaseModel):
+    location: str
+    categories: List[str]
+    radius: int = 5000
+    exclude_service_area_only: bool = True
+
+class BusinessResult(BaseModel):
+    name: str
+    address: str
+    city: str
+    state: str
+    zip_code: str
+    phone: Optional[str] = None
+    website: Optional[str] = None
+    rating: Optional[float] = None
+    total_ratings: Optional[int] = None
+    category: str
+    distance: Optional[float] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+class SearchResponse(BaseModel):
+    results: List[BusinessResult]
+    total_count: int
+    search_info: Dict[str, Any]
+
+class Prospect(BaseModel):
+    id: Optional[int] = None
+    business_name: str
+    decision_maker_name: Optional[str] = None
+    decision_maker_title: Optional[str] = None
+    gatekeeper_name: Optional[str] = None
+    address: str
+    city: str
+    state: str
+    zip_code: str
+    phone: Optional[str] = None
+    website: Optional[str] = None
+    category: str
+    prospect_status: ProspectStatus = ProspectStatus.IDENTIFIED
+    assigned_tsm: Optional[str] = None
+    estimated_fleet_size: Optional[int] = None
+    current_provider: Optional[str] = None
+    current_provider_contract_expires: Optional[date] = None
+    fleet_types: Optional[str] = None
+    visit_notes: Optional[str] = None
+    competitive_info: Optional[str] = None
+    referral_potential: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+    assigned_at: Optional[datetime] = None
+    first_contact_at: Optional[datetime] = None
+    account_opened_at: Optional[datetime] = None
+    first_sale_at: Optional[datetime] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    next_visit_date: Optional[date] = None
+    visit_priority: Optional[int] = None
+
+class FieldActivity(BaseModel):
+    id: Optional[int] = None
+    prospect_id: int
+    activity_type: ActivityType
+    visit_outcome: Optional[VisitOutcome] = None
+    duration_minutes: Optional[int] = None
+    decision_maker_met: bool = False
+    decision_maker_name: Optional[str] = None
+    decision_maker_title: Optional[str] = None
+    fleet_size_discovered: Optional[int] = None
+    current_provider_info: Optional[str] = None
+    interest_level: Optional[int] = None
+    next_steps: Optional[str] = None
+    visit_notes: str
+    competitive_intel: Optional[str] = None
+    referrals_received: Optional[str] = None
+    mileage: Optional[float] = None
+    visit_date: date
+    tsm_name: str
+    created_at: datetime
+
+class TSMAssignment(BaseModel):
+    tsm_name: str
+    prospect_ids: List[int]
+    assignment_notes: Optional[str] = None
+    target_contact_date: Optional[date] = None
+
+class ProspectRequest(BaseModel):
+    business_name: str
+    decision_maker_name: Optional[str] = None
+    decision_maker_title: Optional[str] = None
+    address: str
+    city: str
+    state: str
+    zip_code: str
+    phone: Optional[str] = None
+    website: Optional[str] = None
+    category: str
+    estimated_fleet_size: Optional[int] = None
+    current_provider: Optional[str] = None
+    visit_notes: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    visit_priority: Optional[int] = None
+
+class FieldActivityRequest(BaseModel):
+    prospect_id: int
+    activity_type: ActivityType
+    visit_outcome: VisitOutcome
+    duration_minutes: Optional[int] = None
+    decision_maker_met: bool = False
+    decision_maker_name: Optional[str] = None
+    decision_maker_title: Optional[str] = None
+    fleet_size_discovered: Optional[int] = None
+    current_provider_info: Optional[str] = None
+    interest_level: Optional[int] = None
+    next_steps: Optional[str] = None
+    visit_notes: str
+    competitive_intel: Optional[str] = None
+    referrals_received: Optional[str] = None
+    mileage: Optional[float] = None
+    visit_date: Optional[date] = None
+
+# Database setup
+DATABASE_PATH = "field_sales_crm.db"
+
+@contextmanager
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def init_field_sales_database():
+    """Initialize the field sales CRM database"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        # Prospects table for field sales
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS prospects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_name TEXT NOT NULL,
+                decision_maker_name TEXT,
+                decision_maker_title TEXT,
+                gatekeeper_name TEXT,
+                address TEXT NOT NULL,
+                city TEXT NOT NULL,
+                state TEXT NOT NULL,
+                zip_code TEXT NOT NULL,
+                phone TEXT,
+                website TEXT,
+                category TEXT NOT NULL,
+                prospect_status TEXT DEFAULT 'identified',
+                assigned_tsm TEXT,
+                estimated_fleet_size INTEGER,
+                current_provider TEXT,
+                current_provider_contract_expires DATE,
+                fleet_types TEXT,
+                visit_notes TEXT,
+                competitive_info TEXT,
+                referral_potential INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                assigned_at TIMESTAMP,
+                first_contact_at TIMESTAMP,
+                account_opened_at TIMESTAMP,
+                first_sale_at TIMESTAMP,
+                lat REAL,
+                lng REAL,
+                next_visit_date DATE,
+                visit_priority INTEGER DEFAULT 3
+            )
+        ''')
+        
+        # Field activities table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS field_activities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prospect_id INTEGER NOT NULL,
+                activity_type TEXT NOT NULL,
+                visit_outcome TEXT,
+                duration_minutes INTEGER,
+                decision_maker_met BOOLEAN DEFAULT FALSE,
+                decision_maker_name TEXT,
+                decision_maker_title TEXT,
+                fleet_size_discovered INTEGER,
+                current_provider_info TEXT,
+                interest_level INTEGER,
+                next_steps TEXT,
+                visit_notes TEXT NOT NULL,
+                competitive_intel TEXT,
+                referrals_received TEXT,
+                mileage REAL,
+                visit_date DATE NOT NULL,
+                tsm_name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (prospect_id) REFERENCES prospects (id)
+            )
+        ''')
+        
+        # TSM performance tracking
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tsm_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tsm_name TEXT NOT NULL,
+                metric_date DATE NOT NULL,
+                prospects_assigned INTEGER DEFAULT 0,
+                visits_completed INTEGER DEFAULT 0,
+                contacts_made INTEGER DEFAULT 0,
+                accounts_opened INTEGER DEFAULT 0,
+                first_sales INTEGER DEFAULT 0,
+                total_mileage REAL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(tsm_name, metric_date)
+            )
+        ''')
+        
+        conn.commit()
+
+# Initialize database
+init_field_sales_database()
+
+# Cache for search results
+search_cache = {}
+CACHE_DURATION = timedelta(minutes=20)
+
+# Google Places API configuration
+PLACES_API_KEY = os.getenv("PLACES_API_KEY")
+if not PLACES_API_KEY:
+    print("WARNING: PLACES_API_KEY not found in environment variables")
+
+def load_category_packs():
+    """Load category packs from JSON file"""
+    try:
+        data_path = Path("data/categories.json")
+        if not data_path.exists():
+            return {
+                "Automotive & Fleet Core": [
+                    "car_dealer", "car_rental", "car_repair", "gas_station"
+                ],
+                "Home / Field Services": [
+                    "electrician", "plumber", "roofing_contractor", "painter"
+                ],
+                "Logistics / Mobility": [
+                    "moving_company", "storage", "taxi_service", "logistics"
+                ],
+                "Industrial / Construction Ops": [
+                    "general_contractor", "electrician", "plumber", "hardware_store"
+                ],
+                "Recreation": [
+                    "amusement_park", "zoo", "aquarium", "tourist_attraction"
+                ]
+            }
+        
+        with open(data_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading categories: {e}")
+        return {
+            "Automotive & Fleet Core": [
+                "car_dealer", "car_rental", "car_repair", "gas_station"
+            ],
+            "Home / Field Services": [
+                "electrician", "plumber", "roofing_contractor", "painter"
+            ]
+        }
+
+CATEGORY_PACKS = load_category_packs()
+
+async def geocode_location(location: str) -> Dict[str, float]:
+    """Convert location string to lat/lng coordinates"""
+    if not PLACES_API_KEY:
+        raise HTTPException(status_code=500, detail="Google Places API key not configured")
+    
+    cache_key = f"geocode_{location.lower()}"
+    if cache_key in search_cache:
+        cached_result, timestamp = search_cache[cache_key]
+        if datetime.now() - timestamp < CACHE_DURATION:
+            return cached_result
+    
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    params = {
+        "address": location,
+        "key": PLACES_API_KEY
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, params=params)
+        data = response.json()
+    
+    if data["status"] != "OK" or not data["results"]:
+        raise HTTPException(status_code=400, detail=f"Could not geocode location: {location}")
+    
+    result = data["results"][0]
+    coords = {
+        "lat": result["geometry"]["location"]["lat"],
+        "lng": result["geometry"]["location"]["lng"]
+    }
+    
+    search_cache[cache_key] = (coords, datetime.now())
+    return coords
+
+async def search_places_nearby(lat: float, lng: float, place_types: List[str], radius: int) -> List[Dict]:
+    """Search for places using Google Places API"""
+    if not PLACES_API_KEY:
+        raise HTTPException(status_code=500, detail="Google Places API key not configured")
+    
+    all_results = []
+    
+    for place_type in place_types:
+        cache_key = f"search_{lat}_{lng}_{place_type}_{radius}"
+        if cache_key in search_cache:
+            cached_result, timestamp = search_cache[cache_key]
+            if datetime.now() - timestamp < CACHE_DURATION:
+                all_results.extend(cached_result)
+                continue
+        
+        url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+        params = {
+            "location": f"{lat},{lng}",
+            "radius": radius,
+            "type": place_type,
+            "key": PLACES_API_KEY
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, params=params)
+            data = response.json()
+        
+        if data["status"] == "OK":
+            search_cache[cache_key] = (data["results"], datetime.now())
+            all_results.extend(data["results"])
+    
+    return all_results
+
+def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Calculate distance between two points in miles"""
+    from math import radians, cos, sin, asin, sqrt
+    
+    lat1, lng1, lat2, lng2 = map(radians, [lat1, lng1, lat2, lng2])
+    
+    dlat = lat2 - lat1
+    dlng = lng2 - lng1
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlng/2)**2
+    c = 2 * asin(sqrt(a))
+    r = 3959
+    return c * r
+
+# Routes
+@app.get("/health")
+async def health_check():
+    """Health check endpoint (unprotected)"""
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+@app.get("/")
+async def serve_app(user: str = Depends(get_current_user)):
+    """Serve the main application (protected)"""
+    return FileResponse('app/web/index.html')
+
+@app.get("/crm")
+async def serve_crm(user: str = Depends(get_current_user)):
+    """Serve the CRM interface (protected)"""
+    crm_path = Path('app/web/crm.html')
+    if crm_path.exists():
+        return FileResponse('app/web/crm.html')
+    else:
+        return HTMLResponse("<h1>CRM Interface</h1><p>Upload the CRM HTML file to app/web/crm.html</p>")
+
+@app.get("/categories")
+async def get_categories(user: str = Depends(get_current_user)):
+    """Get available business categories (protected)"""
+    return CATEGORY_PACKS
+
+@app.post("/search/places", response_model=SearchResponse)
+async def search_places(request: SearchRequest, user: str = Depends(get_current_user)) -> SearchResponse:
+    """Search for places based on location and categories (protected)"""
+    try:
+        coords = await geocode_location(request.location)
+        
+        place_types = []
+        for category_pack in request.categories:
+            if category_pack in CATEGORY_PACKS:
+                place_types.extend(CATEGORY_PACKS[category_pack])
+        
+        if not place_types:
+            return SearchResponse(
+                results=[],
+                total_count=0,
+                search_info={
+                    "location": request.location,
+                    "coordinates": coords,
+                    "message": "No valid categories selected"
+                }
+            )
+        
+        places = await search_places_nearby(
+            coords["lat"], 
+            coords["lng"], 
+            place_types, 
+            request.radius
+        )
+        
+        results = []
+        seen_places = set()
+        
+        for place in places:
+            place_id = place.get("place_id")
+            if place_id in seen_places:
+                continue
+            seen_places.add(place_id)
+            
+            if request.exclude_service_area_only:
+                if not place.get("geometry", {}).get("location"):
+                    continue
+            
+            address_components = place.get("vicinity", "")
+            formatted_address = place.get("formatted_address", address_components)
+            
+            address_parts = formatted_address.split(",") if formatted_address else [""]
+            address = address_parts[0].strip() if address_parts else ""
+            city = address_parts[1].strip() if len(address_parts) > 1 else ""
+            state_zip = address_parts[2].strip() if len(address_parts) > 2 else ""
+            
+            state = state_zip.split()[0] if state_zip else ""
+            zip_code = ""
+            if state_zip:
+                zip_parts = state_zip.split()
+                if len(zip_parts) > 1:
+                    zip_code = zip_parts[-1]
+            
+            place_location = place.get("geometry", {}).get("location", {})
+            distance = None
+            if place_location:
+                distance = calculate_distance(
+                    coords["lat"], coords["lng"],
+                    place_location["lat"], place_location["lng"]
+                )
+            
+            place_types_list = place.get("types", [])
+            category = "Unknown"
+            for pack_name, pack_types in CATEGORY_PACKS.items():
+                if any(pt in place_types_list for pt in pack_types):
+                    category = pack_name
+                    break
+            
+            result = BusinessResult(
+                name=place.get("name", "Unknown"),
+                address=address,
+                city=city,
+                state=state,
+                zip_code=zip_code,
+                phone=None,
+                website=None,
+                rating=place.get("rating"),
+                total_ratings=place.get("user_ratings_total"),
+                category=category,
+                distance=round(distance, 2) if distance else None,
+                lat=place_location.get("lat") if place_location else None,
+                lng=place_location.get("lng") if place_location else None
+            )
+            results.append(result)
+        
+        results.sort(key=lambda x: x.distance or float('inf'))
+        
+        return SearchResponse(
+            results=results,
+            total_count=len(results),
+            search_info={
+                "location": request.location,
+                "coordinates": coords,
+                "radius_miles": request.radius * 0.000621371,
+                "categories_searched": request.categories,
+                "place_types": place_types
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+# Field Sales CRM Endpoints
+
+@app.post("/prospects", response_model=Prospect)
+async def create_prospect(request: ProspectRequest, user: str = Depends(get_current_user)):
+    """Create a new prospect"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO prospects (
+                business_name, decision_maker_name, decision_maker_title, address, city, state, zip_code,
+                phone, website, category, estimated_fleet_size, current_provider, visit_notes, 
+                lat, lng, visit_priority, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            request.business_name, request.decision_maker_name, request.decision_maker_title,
+            request.address, request.city, request.state, request.zip_code,
+            request.phone, request.website, request.category,
+            request.estimated_fleet_size, request.current_provider, request.visit_notes,
+            request.lat, request.lng, request.visit_priority or 3, datetime.now(), datetime.now()
+        ))
+        
+        prospect_id = cursor.lastrowid
+        conn.commit()
+        
+        cursor.execute('SELECT * FROM prospects WHERE id = ?', (prospect_id,))
+        row = cursor.fetchone()
+        
+        return Prospect(**dict(row))
+
+@app.get("/prospects", response_model=List[Prospect])
+async def get_prospects(
+    status: Optional[ProspectStatus] = None,
+    assigned_to: Optional[str] = None,
+    category: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    user: str = Depends(get_current_user)
+):
+    """Get prospects with filtering"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        query = "SELECT * FROM prospects WHERE 1=1"
+        params = []
+        
+        if status:
+            query += " AND prospect_status = ?"
+            params.append(status.value)
+        
+        if assigned_to:
+            query += " AND assigned_tsm = ?"
+            params.append(assigned_to)
+        
+        if category:
+            query += " AND category = ?"
+            params.append(category)
+        
+        query += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        
+        return [Prospect(**dict(row)) for row in rows]
+
+@app.post("/prospects/assign-tsm")
+async def assign_prospects_to_tsm(
+    assignment: TSMAssignment, 
+    user: str = Depends(get_current_user)
+):
+    """Assign prospects to a Territory Sales Manager"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        prospect_ids_str = ','.join([str(id) for id in assignment.prospect_ids])
+        
+        cursor.execute(f'''
+            UPDATE prospects 
+            SET assigned_tsm = ?, 
+                prospect_status = 'assigned',
+                assigned_at = ?,
+                next_visit_date = ?,
+                updated_at = ?
+            WHERE id IN ({prospect_ids_str})
+        ''', (
+            assignment.tsm_name, 
+            datetime.now(),
+            assignment.target_contact_date,
+            datetime.now()
+        ))
+        
+        conn.commit()
+        
+        return {
+            "message": f"Assigned {len(assignment.prospect_ids)} prospects to {assignment.tsm_name}",
+            "assigned_count": len(assignment.prospect_ids),
+            "tsm": assignment.tsm_name
+        }
+
+@app.post("/field-activities", response_model=FieldActivity)
+async def log_field_activity(
+    request: FieldActivityRequest, 
+    user: str = Depends(get_current_user)
+):
+    """Log a field visit/activity"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM prospects WHERE id = ?', (request.prospect_id,))
+        prospect = cursor.fetchone()
+        if not prospect:
+            raise HTTPException(status_code=404, detail="Prospect not found")
+        
+        visit_date = request.visit_date or date.today()
+        
+        cursor.execute('''
+            INSERT INTO field_activities (
+                prospect_id, activity_type, visit_outcome, duration_minutes,
+                decision_maker_met, decision_maker_name, decision_maker_title,
+                fleet_size_discovered, current_provider_info, interest_level,
+                next_steps, visit_notes, competitive_intel, referrals_received,
+                mileage, visit_date, tsm_name, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            request.prospect_id, request.activity_type.value, request.visit_outcome.value,
+            request.duration_minutes, request.decision_maker_met, request.decision_maker_name,
+            request.decision_maker_title, request.fleet_size_discovered, request.current_provider_info,
+            request.interest_level, request.next_steps, request.visit_notes,
+            request.competitive_intel, request.referrals_received, request.mileage,
+            visit_date, prospect['assigned_tsm'], datetime.now()
+        ))
+        
+        activity_id = cursor.lastrowid
+        
+        # Update prospect based on visit outcome
+        updates = ["updated_at = ?"]
+        params = [datetime.now()]
+        
+        if request.visit_outcome == VisitOutcome.COMPLETED and prospect['prospect_status'] == 'assigned':
+            updates.extend(["prospect_status = ?", "first_contact_at = ?"])
+            params.extend(['contacted', datetime.now()])
+        
+        if request.decision_maker_met and request.decision_maker_name:
+            updates.extend(["decision_maker_name = ?", "decision_maker_title = ?"])
+            params.extend([request.decision_maker_name, request.decision_maker_title])
+        
+        if request.fleet_size_discovered:
+            updates.append("estimated_fleet_size = ?")
+            params.append(request.fleet_size_discovered)
+        
+        if request.current_provider_info:
+            updates.append("current_provider = ?")
+            params.append(request.current_provider_info)
+            
+        params.append(request.prospect_id)
+        
+        cursor.execute(f'''
+            UPDATE prospects SET {', '.join(updates)} WHERE id = ?
+        ''', params)
+        
+        conn.commit()
+        
+        cursor.execute('SELECT * FROM field_activities WHERE id = ?', (activity_id,))
+        row = cursor.fetchone()
+        
+        return FieldActivity(**dict(row))
+
+@app.get("/dashboard/field-sales-stats")
+async def get_field_sales_dashboard(user: str = Depends(get_current_user)):
+    """Get field sales dashboard statistics"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT 
+                COUNT(*) as total_prospects,
+                COUNT(CASE WHEN prospect_status = 'assigned' THEN 1 END) as assigned_prospects,
+                COUNT(CASE WHEN prospect_status = 'contacted' THEN 1 END) as contacted_prospects,
+                COUNT(CASE WHEN prospect_status = 'account_opened' THEN 1 END) as accounts_opened,
+                COUNT(CASE WHEN prospect_status = 'first_sale' THEN 1 END) as first_sales,
+                COUNT(DISTINCT assigned_tsm) as active_tsms
+            FROM prospects
+        ''')
+        
+        stats = cursor.fetchone()
+        
+        cursor.execute('''
+            SELECT 
+                assigned_tsm,
+                COUNT(*) as assigned_count,
+                COUNT(CASE WHEN prospect_status IN ('contacted', 'qualified', 'account_opened', 'first_sale') 
+                      THEN 1 END) as contacted_count,
+                COUNT(CASE WHEN prospect_status = 'account_opened' THEN 1 END) as accounts_opened,
+                COUNT(CASE WHEN prospect_status = 'first_sale' THEN 1 END) as first_sales
+            FROM prospects 
+            WHERE assigned_tsm IS NOT NULL
+            GROUP BY assigned_tsm
+            ORDER BY assigned_count DESC
+        ''')
+        
+        tsm_performance = [dict(row) for row in cursor.fetchall()]
+        
+        cursor.execute('''
+            SELECT fa.*, p.business_name
+            FROM field_activities fa
+            JOIN prospects p ON fa.prospect_id = p.id
+            ORDER BY fa.created_at DESC
+            LIMIT 10
+        ''')
+        
+        recent_activities = [dict(row) for row in cursor.fetchall()]
+        
+        return {
+            "total_prospects": stats['total_prospects'],
+            "assigned_prospects": stats['assigned_prospects'],
+            "contacted_prospects": stats['contacted_prospects'],
+            "accounts_opened": stats['accounts_opened'],
+            "first_sales": stats['first_sales'],
+            "active_tsms": stats['active_tsms'],
+            "contact_rate": round((stats['contacted_prospects'] / stats['assigned_prospects'] * 100) if stats['assigned_prospects'] > 0 else 0, 1),
+            "account_conversion_rate": round((stats['accounts_opened'] / stats['contacted_prospects'] * 100) if stats['contacted_prospects'] > 0 else 0, 1),
+            "tsm_performance": tsm_performance,
+            "recent_activities": recent_activities
+        }
+
+@app.post("/prospects/import-from-search")
+async def import_prospects_from_search(
+    search_results: List[BusinessResult], 
+    user: str = Depends(get_current_user)
+):
+    """Import prospects from search results"""
+    imported_count = 0
+    skipped_count = 0
+    
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        for result in search_results:
+            cursor.execute('''
+                SELECT id FROM prospects 
+                WHERE business_name = ? AND address = ?
+            ''', (result.name, result.address))
+            
+            if cursor.fetchone():
+                skipped_count += 1
+                continue
+            
+            cursor.execute('''
+                INSERT INTO prospects (
+                    business_name, address, city, state, zip_code, phone,
+                    website, category, lat, lng, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                result.name, result.address, result.city, result.state,
+                result.zip_code, result.phone, result.website, result.category,
+                result.lat, result.lng, datetime.now(), datetime.now()
+            ))
+            imported_count += 1
+        
+        conn.commit()
+    
+    return {
+        "imported": imported_count,
+        "skipped": skipped_count,
+        "message": f"Imported {imported_count} new prospects, skipped {skipped_count} duplicates"
+    }
+
+# Mount static files
+if Path("app/web").exists():
+    app.mount("/static", StaticFiles(directory="app/web"), name="static")
+
+@app.get("/{file_path:path}")
+async def serve_static_files(file_path: str, user: str = Depends(get_current_user)):
+    """Serve static files (protected)"""
+    static_file_path = Path(f"app/web/{file_path}")
+    if static_file_path.exists() and static_file_path.is_file():
+        return FileResponse(static_file_path)
+    raise HTTPException(status_code=404, detail="File not found")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
